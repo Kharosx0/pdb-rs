@@ -261,6 +261,14 @@ pub fn dump_type_record(
         TypeData::FieldList(fields) => {
             writeln!(out)?;
             for field in fields.iter() {
+                let field = match field {
+                    Ok(f) => f,
+                    Err(e) => {
+                        // Report rather than silently truncating the dump.
+                        writeln!(out, "    <undecodable field: {e}>")?;
+                        break;
+                    }
+                };
                 match field {
                     Field::Member(m) => {
                         write!(out, "    at {} : {} ", m.offset, m.name)?;

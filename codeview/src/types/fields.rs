@@ -13,6 +13,11 @@ pub struct FieldList<'a> {
 
 impl<'a> FieldList<'a> {
     /// Iterates the fields within an `LF_FIELDLIST` type string.
+    ///
+    /// Iteration is *fail-closed*: if a field record cannot be decoded (for example, an
+    /// unrecognized `LF_*` item kind), the iterator yields `Err` and then ends, rather
+    /// than silently truncating the field list. Silently stopping would make a caller
+    /// that computes record layout produce a wrong answer with no indication of error.
     pub fn iter(&self) -> IterFields<'a> {
         IterFields { bytes: self.bytes }
     }
@@ -23,7 +28,14 @@ impl<'a> Debug for FieldList<'a> {
         if f.alternate() {
             let mut list = f.debug_list();
             for f in self.iter() {
-                list.entry(&f);
+                match f {
+                    Ok(f) => {
+                        list.entry(&f);
+                    }
+                    Err(e) => {
+                        list.entry(&format_args!("<error: {e}>"));
+                    }
+                }
             }
             list.finish()
         } else {
@@ -301,7 +313,7 @@ impl<'a> Parse<'a> for Method<'a> {
 }
 
 impl<'a> Iterator for IterFields<'a> {
-    type Item = Field<'a>;
+    type Item = Result<Field<'a>, ParserError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.bytes.is_empty() {
@@ -327,9 +339,14 @@ impl<'a> Iterator for IterFields<'a> {
         match Field::parse(&mut p) {
             Ok(f) => {
                 self.bytes = p.into_rest();
-                Some(f)
+                Some(Ok(f))
             }
-            Err(ParserError) => None,
+            Err(e) => {
+                // Fuse the iterator: the remaining bytes cannot be located without
+                // knowing the length of the item we failed to decode.
+                self.bytes = &[];
+                Some(Err(e))
+            }
         }
     }
 }
@@ -385,5 +402,50 @@ impl<'a> Field<'a> {
                 return Err(ParserError::new());
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An `LF_MEMBER` item: attr(u16), ty(u32), offset(numeric), name(strz).
+    fn member_item(name: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&Leaf::LF_MEMBER.0.to_le_bytes());
+        v.extend_from_slice(&0u16.to_le_bytes()); // attr
+        v.extend_from_slice(&0x1000u32.to_le_bytes()); // ty
+        v.extend_from_slice(&0u16.to_le_bytes()); // offset: immediate numeric 0
+        v.extend_from_slice(name);
+        v.push(0);
+        v
+    }
+
+    /// A well-formed field list decodes every item and then ends cleanly.
+    #[test]
+    fn iter_fields_decodes_all_items() {
+        let mut bytes = member_item(b"a");
+        bytes.extend_from_slice(&member_item(b"b"));
+        let list = FieldList { bytes: &bytes };
+        let got: Vec<_> = list.iter().collect();
+        assert_eq!(got.len(), 2);
+        assert!(got.iter().all(|f| f.is_ok()));
+    }
+
+    /// An unrecognized item kind must surface an error, NOT silently end iteration.
+    ///
+    /// Silently truncating a field list makes a caller that computes record layout
+    /// produce a wrong answer with no indication that anything went wrong.
+    #[test]
+    fn iter_fields_reports_unrecognized_item_instead_of_truncating() {
+        let mut bytes = member_item(b"a");
+        bytes.extend_from_slice(&0xdeadu16.to_le_bytes()); // not a valid LF_* item kind
+        let list = FieldList { bytes: &bytes };
+        let got: Vec<_> = list.iter().collect();
+        assert_eq!(got.len(), 2, "expected the good field and then an error");
+        assert!(got[0].is_ok());
+        assert!(got[1].is_err(), "unrecognized item kind must yield Err");
+        // The iterator is fused after the error.
+        assert!(list.iter().nth(2).is_none());
     }
 }
