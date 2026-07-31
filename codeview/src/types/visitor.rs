@@ -456,7 +456,11 @@ pub fn visit_type_indexes_in_record<V: RecordVisitor>(
                             ?after,
                             "unrecognized item within LF_FIELDLIST"
                         );
-                        break;
+                        // Fail closed. Stopping silently here would leave the remaining
+                        // items of this field list unvisited, so a caller remapping type
+                        // indexes would emit a record that still refers to the old index
+                        // space.
+                        return Err(ParserError::new());
                     }
                 }
             }
