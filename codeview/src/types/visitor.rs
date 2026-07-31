@@ -519,11 +519,26 @@ pub fn visit_type_indexes_in_record<V: RecordVisitor>(
             p.ty()?; // base_vftable
         }
 
-        Leaf::LF_CLASS2 | Leaf::LF_STRUCTURE2 | Leaf::LF_UNION2 | Leaf::LF_INTERFACE2 => {
+        // The `*2` UDT leaves widen `property` to 32 bits and move it to the front. The
+        // class-like forms keep `field`, `derived` and `vshape`; the union form, like the
+        // v1 `LF_UNION`, has only `field`.
+        //
+        // Microsoft has not published a layout for any of these (`cvinfo.h` defines no
+        // `lfClass2`/`lfUnion2`/`CV_prop32_t`, and microsoft-pdb#50 asking for one is still
+        // open), so this follows the only available evidence: the v1 `lfUnion`, which has
+        // no `derived`/`vshape`, and Ghidra's reverse-engineered `Union19MsType`, which
+        // likewise omits both. Grouping `LF_UNION2` with the class-likes would misread the
+        // record's `count` and `length` numeric leaves as two type indexes.
+        Leaf::LF_CLASS2 | Leaf::LF_STRUCTURE2 | Leaf::LF_INTERFACE2 => {
             p.skip(4)?; // property
             p.ty()?; // field
             p.ty()?; // derived
             p.ty()?; // vshape
+        }
+
+        Leaf::LF_UNION2 => {
+            p.skip(4)?; // property
+            p.ty()?; // field
         }
 
         Leaf::LF_FUNC_ID => {
