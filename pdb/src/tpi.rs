@@ -43,6 +43,7 @@ use crate::types::fields::{Field, IterFields};
 use crate::types::{TypeData, TypeIndex, TypeIndexLe, TypeRecord, TypesIter, build_types_starts};
 use anyhow::bail;
 use ms_codeview::parser::Parser;
+use std::collections::HashSet;
 use std::fmt::Debug;
 use std::mem::size_of;
 use std::ops::Range;
@@ -395,6 +396,11 @@ where
 
     /// Iterate the fields of an `LF_STRUCTURE`, `LF_CLASS`, `LF_ENUM`, etc. This correctly
     /// iterates across chains of `LF_FIELDLIST`.
+    ///
+    /// Iteration is *fail-closed*: a field that cannot be decoded, a continuation record
+    /// that cannot be read or is not an `LF_FIELDLIST`, or a cycle in the continuation
+    /// chain all yield `Err` rather than silently ending iteration. A caller computing
+    /// record layout would otherwise silently observe a truncated field list.
     pub fn iter_fields(&self, field_list: TypeIndex) -> IterFieldChain<'_, StreamData> {
         // We initialize `fields` to an empty iterator so that the first iteration of
         // IterFieldChain::next() will find no records and will then check next_field_list.
@@ -406,6 +412,7 @@ where
                 None
             },
             fields: IterFields { bytes: &[] },
+            visited: HashSet::new(),
         }
     }
 }
@@ -423,40 +430,61 @@ where
 
     /// The pointer to the next `LF_FIELDLIST` that we will decode.
     next_field_list: Option<TypeIndex>,
+
+    /// The `LF_FIELDLIST` records already visited on this chain. A malformed PDB can
+    /// contain a cyclic `LF_INDEX` continuation chain; without this, iteration would
+    /// never terminate.
+    visited: HashSet<TypeIndex>,
 }
 
 impl<'a, StreamData> Iterator for IterFieldChain<'a, StreamData>
 where
     StreamData: AsRef<[u8]>,
 {
-    type Item = Field<'a>;
+    type Item = anyhow::Result<Field<'a>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            if let Some(field) = self.fields.next() {
-                if let Field::Index(index) = &field {
+            match self.fields.next() {
+                Some(Ok(Field::Index(index))) => {
                     // The full field list is split across more than one LF_FIELDLIST record.
                     // Store the link to the next field list and do not return this item to the caller.
-                    self.next_field_list = Some(*index);
+                    self.next_field_list = Some(index);
                     continue;
                 }
-
-                return Some(field);
+                Some(Ok(field)) => return Some(Ok(field)),
+                Some(Err(e)) => {
+                    // A field record failed to decode. Stop, but report it.
+                    self.next_field_list = None;
+                    return Some(Err(e.into()));
+                }
+                None => {}
             }
 
             // We have run out of fields in the current LF_FIELDLIST record.
             // See if there is a pointer to another LF_FIELDLIST.
             let next_field_list = self.next_field_list.take()?;
-            let next_record = self.type_stream.record(next_field_list).ok()?;
-            match next_record.parse().ok()? {
-                TypeData::FieldList(fl) => {
+            if !self.visited.insert(next_field_list) {
+                return Some(Err(anyhow::anyhow!(
+                    "cycle detected in LF_FIELDLIST continuation chain at {next_field_list:?}"
+                )));
+            }
+            let next_record = match self.type_stream.record(next_field_list) {
+                Ok(r) => r,
+                Err(e) => return Some(Err(e)),
+            };
+            match next_record.parse() {
+                Ok(TypeData::FieldList(fl)) => {
                     // Restart iteration on the new field list.
                     self.fields = fl.iter();
                 }
-                _ => {
+                Ok(_) => {
                     // Wrong record type!
-                    return None;
+                    return Some(Err(anyhow::anyhow!(
+                        "LF_INDEX continuation at {next_field_list:?} does not point to an LF_FIELDLIST"
+                    )));
                 }
+                Err(e) => return Some(Err(e.into())),
             }
         }
     }
@@ -551,5 +579,109 @@ impl CachedTypeStreamHeader {
         } else {
             TypeIndex::MIN_BEGIN
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::fields::Field;
+
+    /// Frames one type record: `len: u16` (bytes that follow), `kind: u16`, then `data`.
+    fn record(kind: u16, data: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        let len = (2 + data.len()) as u16;
+        v.extend_from_slice(&len.to_le_bytes());
+        v.extend_from_slice(&kind.to_le_bytes());
+        v.extend_from_slice(data);
+        v
+    }
+
+    /// An `LF_MEMBER` item: attr(u16), ty(u32), offset(numeric), name(strz).
+    fn member_item(name: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&0x150du16.to_le_bytes()); // LF_MEMBER
+        v.extend_from_slice(&0u16.to_le_bytes()); // attr
+        v.extend_from_slice(&0x1000u32.to_le_bytes()); // ty
+        v.extend_from_slice(&0u16.to_le_bytes()); // offset
+        v.extend_from_slice(name);
+        v.push(0);
+        v
+    }
+
+    /// An `LF_INDEX` continuation item: kind(u16), pad(u16), ty(u32).
+    fn index_item(target: u32) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&0x1404u16.to_le_bytes()); // LF_INDEX
+        v.extend_from_slice(&0u16.to_le_bytes()); // padding
+        v.extend_from_slice(&target.to_le_bytes());
+        v
+    }
+
+    /// Builds a minimal TPI stream containing `records`, starting at TypeIndex 0x1000.
+    fn type_stream(records: &[Vec<u8>]) -> TypeStream<Vec<u8>> {
+        let mut body = Vec::new();
+        for r in records {
+            body.extend_from_slice(r);
+        }
+        let mut header = TypeStreamHeader::empty();
+        header.type_index_begin = TypeIndexLe(U32::new(0x1000));
+        header.type_index_end = TypeIndexLe(U32::new(0x1000 + records.len() as u32));
+        header.type_record_bytes = U32::new(body.len() as u32);
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&body);
+        TypeStream::parse(Stream::TPI, bytes).expect("synthetic type stream should parse")
+    }
+
+    /// A cyclic `LF_INDEX` continuation chain must terminate with an error rather than
+    /// looping forever.
+    #[test]
+    fn iter_fields_detects_continuation_cycle() {
+        // 0x1000: [ LF_MEMBER "a", LF_INDEX -> 0x1001 ]
+        // 0x1001: [ LF_INDEX -> 0x1000 ]   <-- cycle back
+        let mut first = member_item(b"a");
+        first.extend_from_slice(&index_item(0x1001));
+        let second = index_item(0x1000);
+        let ts = type_stream(&[
+            record(0x1203, &first),  // LF_FIELDLIST
+            record(0x1203, &second), // LF_FIELDLIST
+        ]);
+
+        // Bound the take so that a regression in the cycle guard fails this test
+        // quickly instead of hanging the test run forever.
+        let got: Vec<_> = ts.iter_fields(TypeIndex(0x1000)).take(8).collect();
+        assert_eq!(
+            got.len(),
+            2,
+            "expected the member then a cycle error: {got:?}"
+        );
+        assert!(
+            matches!(got[0], Ok(Field::Member(_))),
+            "first item: {:?}",
+            got[0]
+        );
+        let err = got[1].as_ref().expect_err("cycle must be reported");
+        assert!(
+            err.to_string().contains("cycle"),
+            "error should name the cycle: {err}"
+        );
+    }
+
+    /// A non-cyclic continuation chain still walks every record.
+    #[test]
+    fn iter_fields_follows_continuation_chain() {
+        let mut first = member_item(b"a");
+        first.extend_from_slice(&index_item(0x1001));
+        let second = member_item(b"b");
+        let ts = type_stream(&[record(0x1203, &first), record(0x1203, &second)]);
+
+        let got: Vec<_> = ts.iter_fields(TypeIndex(0x1000)).collect();
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert!(
+            got.iter().all(|f| matches!(f, Ok(Field::Member(_)))),
+            "{got:?}"
+        );
     }
 }

@@ -158,6 +158,7 @@ fn types() -> anyhow::Result<()> {
         // Index the member (data) fields by name
         let mut fields: HashMap<&BStr, TypeIndex> = HashMap::new();
         for f in type_stream.iter_fields(primitives_ty_struct.fixed.field_list.get()) {
+            let f = f.expect("field list should decode cleanly");
             match f {
                 Field::Member(m) => {
                     // Turn this on when adding new fields in types.cpp
